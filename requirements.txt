@@ -5,3 +5,4 @@ pypdf
 langchain
 python-dotenv
 streamlit-local-storage
+pysqlite3-binary

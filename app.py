@@ -16,7 +16,7 @@ PDF_DIR = "data"
 PERSIST_DIR = "chroma_db_bio"
 COLLECTION_NAME = "bioinformatics_docs"
 GEMINI_EMBEDDING_MODEL = "models/embedding-001"
-GEMINI_GENERATIVE_MODEL = "gemini-2.5-flash"
+GEMINI_GENERATIVE_MODEL = "gemini-1.5-flash"
 CHUNK_SIZE = 1500
 CHUNK_OVERLAP = 150
 

@@ -1,7 +1,0 @@
-streamlit==1.44.1
-google-generativeai
-chromadb
-pypdf
-langchain
-python-dotenv
-streamlit-local-storage

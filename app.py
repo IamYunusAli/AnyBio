@@ -1,20 +1,21 @@
 import streamlit as st
 import google.generativeai as genai
-import chromadb
-from chromadb.utils import embedding_functions
 import pypdf
 import os
 import time
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from dotenv import load_dotenv
-import shutil
 from streamlit_local_storage import LocalStorage
+
+# Import LangChain components for FAISS and Gemini Embeddings
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from langchain_community.vectorstores import FAISS
+import faiss
 
 # --- Configuration ---
 load_dotenv()
 PDF_DIR = "data"
-PERSIST_DIR = "chroma_db_bio"
-COLLECTION_NAME = "bioinformatics_docs"
+FAISS_INDEX_PATH = "faiss_index_bio"
 GEMINI_EMBEDDING_MODEL = "models/embedding-001"
 GEMINI_GENERATIVE_MODEL = "gemini-1.5-flash"
 CHUNK_SIZE = 1500
@@ -65,99 +66,60 @@ def load_and_process_pdfs_v2():
     )
 
     all_chunks = []
-    doc_ids = []
     metadatas = []
     chunk_id_counter = 0
 
     for doc in all_texts:
         chunks = text_splitter.split_text(doc["content"])
-        for chunk in chunks:
+        for chunk_idx, chunk in enumerate(chunks):
             all_chunks.append(chunk)
-            doc_ids.append(f"doc_{doc['filename']}_chunk_{chunk_id_counter}")
-            metadatas.append({"source": doc["filename"]})
+            metadatas.append({"source": doc["filename"], "chunk": chunk_idx})
             chunk_id_counter += 1
 
-    return all_chunks, doc_ids, metadatas
+    return all_chunks, metadatas
 
-@st.cache_resource
-def setup_vector_store(chunks, doc_ids, metadatas, api_key):
-    """Sets up ChromaDB, embeds chunks, and adds them to the collection."""
-    if not chunks:
+@st.cache_resource(ttl=3600)
+def setup_faiss_vector_store(chunks, metadatas, api_key):
+    """Creates or loads a FAISS vector store with Gemini embeddings."""
+    if not chunks or not metadatas:
         st.error("No text chunks available to create vector store.")
         return None
 
     try:
-        genai.configure(api_key=api_key)
+        embeddings = GoogleGenerativeAIEmbeddings(model=GEMINI_EMBEDDING_MODEL, google_api_key=api_key)
 
-        client = chromadb.PersistentClient(path=PERSIST_DIR)
-
-        try:
-            collection = client.get_collection(name=COLLECTION_NAME)
-            if collection.count() > 0:
-                return collection
-        except Exception:
-            pass
-
-        collection = client.get_or_create_collection(name=COLLECTION_NAME)
-
-        if collection.count() == 0:
-            embeddings = []
-            batch_size = 100
-            total_chunks = len(chunks)
-
-            for i in range(0, total_chunks, batch_size):
-                batch_chunks = chunks[i:i+batch_size]
-                try:
-                    result = genai.embed_content(
-                        model=GEMINI_EMBEDDING_MODEL,
-                        content=batch_chunks,
-                        task_type="retrieval_document"
-                    )
-                    embeddings.extend(result['embedding'])
-                except Exception as e:
-                    st.error(f"Error embedding batch {i//batch_size + 1}: {e}")
-                    return None
-                time.sleep(1)
-
-            if len(embeddings) != len(chunks):
-                 st.error(f"Mismatch in number of chunks ({len(chunks)}) and embeddings ({len(embeddings)}). Aborting.")
-                 return None
-
-            chroma_batch_size = 5000
-            for i in range(0, len(chunks), chroma_batch_size):
-                batch_end = min(i + chroma_batch_size, len(chunks))
-                collection.add(
-                    embeddings=embeddings[i:batch_end],
-                    documents=chunks[i:batch_end],
-                    metadatas=metadatas[i:batch_end],
-                    ids=doc_ids[i:batch_end]
+        if os.path.exists(FAISS_INDEX_PATH):
+            try:
+                vector_store = FAISS.load_local(
+                    FAISS_INDEX_PATH,
+                    embeddings,
+                    allow_dangerous_deserialization=True
                 )
+                return vector_store
+            except Exception as load_e:
+                st.warning(f"Failed to load existing FAISS index ({load_e}). Rebuilding...")
 
-        return collection
+        vector_store = FAISS.from_texts(chunks, embedding=embeddings, metadatas=metadatas)
+        vector_store.save_local(FAISS_INDEX_PATH)
+        
+        return vector_store
 
     except Exception as e:
-        st.error(f"Failed to setup vector store: {e}")
+        st.error(f"Failed to setup FAISS vector store: {e}")
         return None
 
-def get_relevant_context(query, collection, api_key, n_results=5):
-    """Embeds query and retrieves relevant context from ChromaDB."""
+def get_relevant_context(query, vector_store, api_key, n_results=5):
+    """Retrieves relevant context from FAISS vector store."""
+    if not vector_store:
+        st.error("Vector store not initialized.")
+        return [], []
     try:
-        genai.configure(api_key=api_key)
-        query_embedding_result = genai.embed_content(
-            model=GEMINI_EMBEDDING_MODEL,
-            content=query,
-            task_type="retrieval_query"
-        )
-        query_embedding = query_embedding_result['embedding']
-
-        results = collection.query(
-            query_embeddings=[query_embedding],
-            n_results=n_results,
-            include=['documents', 'metadatas']
-        )
-        return results['documents'][0], results['metadatas'][0]
+        results_with_scores = vector_store.similarity_search_with_score(query, k=n_results)
+        context_docs = [doc.page_content for doc, score in results_with_scores]
+        context_metadatas = [doc.metadata for doc, score in results_with_scores]
+        return context_docs, context_metadatas
     except Exception as e:
-        st.error(f"Error retrieving context: {e}")
+        st.error(f"Error retrieving context from FAISS: {e}")
         return [], []
 
 def generate_response(query, context_docs, context_metadatas, api_key):
@@ -229,20 +191,27 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Database Management")
-    if st.button("Re-create Knowledge Base", help=f"Deletes the current database ({PERSIST_DIR}) and re-processes PDFs from '{PDF_DIR}'. This requires a restart."):
-        with st.spinner("Attempting to delete existing database and clear cache..."):
+    if st.button("Re-create Knowledge Base", help=f"Deletes the current FAISS index ({FAISS_INDEX_PATH}) and re-processes PDFs from '{PDF_DIR}'. This requires a restart."):
+        with st.spinner("Attempting to delete existing FAISS index and clear cache..."):
             delete_success = False
-            if os.path.exists(PERSIST_DIR):
+            if os.path.exists(FAISS_INDEX_PATH):
                 try:
-                    shutil.rmtree(PERSIST_DIR)
-                    st.success(f"Deleted database directory: {PERSIST_DIR}")
+                    index_file = os.path.join(FAISS_INDEX_PATH, "index.faiss")
+                    pkl_file = os.path.join(FAISS_INDEX_PATH, "index.pkl")
+                    if os.path.exists(index_file):
+                        os.remove(index_file)
+                    if os.path.exists(pkl_file):
+                        os.remove(pkl_file)
+                    try:
+                        os.rmdir(FAISS_INDEX_PATH)
+                    except OSError:
+                         pass
+                    st.success(f"Deleted FAISS index files in: {FAISS_INDEX_PATH}")
                     delete_success = True
-                except PermissionError as pe:
-                     st.error(f"Error deleting directory {PERSIST_DIR}: File is likely still in use by the app. Please RESTART the Streamlit app completely. The database will be rebuilt after restart. Details: {pe}")
                 except Exception as e:
-                    st.error(f"Error deleting directory {PERSIST_DIR}: {e}")
+                    st.error(f"Error deleting FAISS index files in {FAISS_INDEX_PATH}: {e}. Manual deletion might be required.")
             else:
-                st.info("Database directory not found, nothing to delete.")
+                st.info("FAISS index not found, nothing to delete.")
                 delete_success = True
 
             if delete_success:
@@ -250,7 +219,7 @@ with st.sidebar:
                 st.cache_resource.clear()
                 st.success("Cleared Streamlit cache. Please refresh the page or restart the app to rebuild the knowledge base.")
             else:
-                 st.warning("Could not delete database directory. Cache not cleared. Please restart the app manually.")
+                 st.warning("Could not delete FAISS index. Cache not cleared. Please restart the app manually.")
 
 # --- API Key Handling & Initialization ---
 
@@ -271,32 +240,19 @@ except Exception as e:
 init_start_time = time.time()
 
 initialization_successful = False
-chroma_collection = None
+faiss_vector_store = None
 
-db_exists = os.path.exists(PERSIST_DIR) and len(os.listdir(PERSIST_DIR)) > 0
+with st.spinner("Initializing knowledge base... This may take a few minutes the first time."):
+    chunks, metadatas = load_and_process_pdfs_v2()
 
-if db_exists:
-     try:
-         client = chromadb.PersistentClient(path=PERSIST_DIR)
-         collection_maybe = client.get_collection(name=COLLECTION_NAME)
-         if collection_maybe.count() > 0:
-             chroma_collection = collection_maybe
-             initialization_successful = True
-     except Exception as e:
-         pass
+    if chunks and metadatas:
+        faiss_vector_store = setup_faiss_vector_store(chunks, metadatas, api_key)
+        if faiss_vector_store:
+            initialization_successful = True
+    else:
+        st.error("Failed to load or process PDFs. Cannot initialize chatbot.")
 
-if not initialization_successful:
-    with st.spinner("Initializing knowledge base... This may take a few minutes the first time."):
-        chunks, doc_ids, metadatas = load_and_process_pdfs_v2()
-
-        if chunks and doc_ids and metadatas:
-            chroma_collection = setup_vector_store(chunks, doc_ids, metadatas, api_key)
-            if chroma_collection:
-                initialization_successful = True
-        else:
-            st.error("Failed to load or process PDFs. Cannot initialize chatbot.")
-
-if not initialization_successful or not chroma_collection:
+if not initialization_successful or not faiss_vector_store:
     st.error("Knowledge base initialization failed. Please check PDF files, API key, and logs.")
     st.stop()
 
@@ -316,7 +272,7 @@ if prompt := st.chat_input("Ask a question about bioinformatics..."):
     with st.chat_message("assistant"):
         message_placeholder = st.empty()
         with st.spinner("Thinking..."):
-            context_docs, context_metadatas = get_relevant_context(prompt, chroma_collection, api_key)
+            context_docs, context_metadatas = get_relevant_context(prompt, faiss_vector_store, api_key)
 
             if not context_docs:
                 full_response = "I couldn't find relevant information in the documents to answer your question."

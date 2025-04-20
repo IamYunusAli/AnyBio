@@ -4,6 +4,7 @@ pypdf
 langchain
 python-dotenv
 streamlit-local-storage
+<<<<<<< HEAD
 faiss-cpu
 langchain-google-genai
 langchain-community

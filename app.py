@@ -161,7 +161,7 @@ TEXTS = {
 # --- Helper Functions ---
 
 @st.cache_data
-def load_and_process_pdfs_v2():
+def load_and_process_pdfs():
     """Loads PDFs from global PDF_DIR, extracts text, and splits into chunks."""
     pdf_directory = PDF_DIR
     all_texts = []
@@ -420,16 +420,16 @@ init_start_time = time.time()
 initialization_successful = False
 faiss_vector_store = None
 
-# Use translated spinner text
-with st.spinner(current_texts["init_spinner"]):
-    chunks, metadatas = load_and_process_pdfs_v2()
 
+with st.spinner(current_texts["init_spinner"]):
+    chunks, metadatas = load_and_process_pdfs()
     if chunks and metadatas:
         faiss_vector_store = setup_faiss_vector_store(chunks, metadatas, api_key)
         if faiss_vector_store:
             initialization_successful = True
     else:
         st.error(current_texts["pdf_load_error"])
+
 
 # Use translated error message
 if not initialization_successful or not faiss_vector_store:

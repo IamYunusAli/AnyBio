@@ -1,4 +1,4 @@
-# AnyBio: Bioinformatics Chat Application
+# AnyBio: Bioinformatics Research AI Assistant
 
 AnyBio is a Streamlit-based application that allows users to interact with a bioinformatics knowledge base. It uses Google Generative AI and FAISS for document embedding and retrieval.
 
